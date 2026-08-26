@@ -1,0 +1,35 @@
+# Dependencies and package-manager caches
+node_modules/
+.npm-cache/
+.npm/
+.pnpm-store/
+
+# Build output and package archives
+lib/
+dist/
+coverage/
+*.tsbuildinfo
+*.tgz
+
+# Local plugin data and imported user audio
+sounds/
+preferences.json
+
+# Local agent notes and editor state
+Agent.md
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Operating-system files
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Diagnostic output
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
