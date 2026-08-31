@@ -24,7 +24,7 @@ Open **Settings -> Plugins -> DSH Reminder** to configure:
 - Built-in tones or imported MP3/WAV files for each event.
 - A separate volume control and preview button for every event.
 
-The 50% volume setting matches the original default reminder loudness. Imported tones and event preferences persist across DSH restarts.
+The 50% volume setting matches the original default reminder loudness. Imported tones and event preferences persist across DSH restarts. After a plugin reload or a DSH restart, click a preview button once to prepare browser audio for background reminders.
 
 ## Custom Tones
 

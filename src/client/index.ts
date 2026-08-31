@@ -35,20 +35,39 @@ type DesktopAttention = {
   }>
 }
 
+type SessionSummary = {
+  id?: string
+  sessionId?: string
+  title?: string
+  displayTitle?: string
+  running: boolean
+  origin?: string
+  pendingInteraction?: 'approval' | 'question' | string
+  projectionValues?: Record<string, unknown>
+}
+
+type SessionListSnapshot = {
+  // DSH Desktop before 0.1.2 exposed a keyed snapshot; current builds expose items.
+  ids?: string[]
+  byId?: Record<string, SessionSummary>
+  items?: SessionSummary[]
+}
+
 type Sessions = {
   list: {
-    getSnapshot(): {
-      ids: string[]
-      byId: Record<string, {
-        id: string
-        title?: string
-        displayTitle?: string
-        running: boolean
-        origin?: string
-        pendingInteraction?: 'approval' | 'question' | string
-        projectionValues?: Record<string, unknown>
-      }>
-    }
+    getSnapshot(): SessionListSnapshot
+    subscribe(listener: () => void): () => void
+  }
+}
+
+type Remote = {
+  $on(event: 'user-questions/request' | 'approval/request', listener: (this: unknown, request: unknown, next: () => Promise<unknown>) => Promise<unknown>): void
+}
+
+type PendingInteraction = { key: string; kind: 'approval' | 'question' | 'plan-review' | string }
+type UiSession = {
+  pendingInteractions: {
+    getSnapshot(): Map<string, PendingInteraction>
     subscribe(listener: () => void): () => void
   }
 }
@@ -63,14 +82,45 @@ type ClientContext = {
   slots: SlotsService
   locale: LocaleService
   sessions: Sessions
+  remote: Remote
+  uiSession: UiSession
   connection: Connection
   effect(fn: () => void | (() => void), label?: string): void
 }
 
 type ImportedTone = { id: string; name: string }
-const importedToneUrls = new Map<string, string>()
+const importedToneBuffers = new Map<string, AudioBuffer>()
 let runtimePreferences: Preferences | undefined
 let preferencesReady: Promise<void> | undefined
+let sharedAudioContext: AudioContext | undefined
+let audioUnlocked = false
+
+type AudioContextConstructor = typeof AudioContext
+
+function audioContext(): AudioContext {
+  if (sharedAudioContext) return sharedAudioContext
+  const AudioContextCtor = (window.AudioContext || (window as any).webkitAudioContext) as AudioContextConstructor | undefined
+  if (!AudioContextCtor) throw new Error('Web Audio is unavailable.')
+  sharedAudioContext = new AudioContextCtor()
+  return sharedAudioContext
+}
+
+async function unlockAudio(): Promise<void> {
+  const audio = audioContext()
+  if (audio.state !== 'running') await audio.resume()
+  if (audio.state !== 'running') throw new Error('Audio playback is blocked until you interact with DSH Desktop.')
+  audioUnlocked = true
+}
+
+function installAudioUnlock(): () => void {
+  const unlock = () => { void unlockAudio().catch(() => {}) }
+  document.addEventListener('pointerdown', unlock, { capture: true })
+  document.addEventListener('keydown', unlock, { capture: true })
+  return () => {
+    document.removeEventListener('pointerdown', unlock, { capture: true })
+    document.removeEventListener('keydown', unlock, { capture: true })
+  }
+}
 
 async function reminderRpc<T>(ctx: ClientContext, endpoint: string, payload: unknown): Promise<T> {
   const result = await ctx.connection.rpc.call('/dsh-reminder', endpoint, payload)
@@ -84,14 +134,15 @@ function base64FromBytes(bytes: Uint8Array): string {
   return btoa(value)
 }
 
-async function importedToneUrl(ctx: ClientContext, id: string): Promise<string> {
-  const cached = importedToneUrls.get(id)
+async function importedToneBuffer(ctx: ClientContext, id: string): Promise<AudioBuffer> {
+  const cached = importedToneBuffers.get(id)
   if (cached) return cached
   const response = await reminderRpc<{ data: string }>(ctx, 'readTone', { id })
   const bytes = Uint8Array.from(atob(response.data), (character) => character.charCodeAt(0))
-  const url = URL.createObjectURL(new Blob([bytes], { type: id.endsWith('.wav') ? 'audio/wav' : 'audio/mpeg' }))
-  importedToneUrls.set(id, url)
-  return url
+  const source = bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer
+  const buffer = await audioContext().decodeAudioData(source)
+  importedToneBuffers.set(id, buffer)
+  return buffer
 }
 
 const defaults: Preferences = {
@@ -152,44 +203,81 @@ async function playTone(ctx: ClientContext, id: SoundId, volume = 0.5): Promise<
   const normalizedVolume = Math.max(0, Math.min(1, volume))
   const playbackGain = normalizedVolume * 2
   if (id === 'none') return
+  await unlockAudio()
+  const audio = audioContext()
   if (id.startsWith('imported:')) {
-    try {
-      const audio = new Audio(await importedToneUrl(ctx, id.slice('imported:'.length)))
-      audio.volume = Math.min(1, 0.65 * playbackGain)
-      await audio.play()
-    } catch {
-      // The selected imported tone may have been removed outside the plugin.
-    }
+    const source = audio.createBufferSource()
+    const gain = audio.createGain()
+    source.buffer = await importedToneBuffer(ctx, id.slice('imported:'.length))
+    gain.gain.value = Math.min(1, 0.65 * playbackGain)
+    source.connect(gain).connect(audio.destination)
+    source.start()
     return
   }
-  try {
-    const AudioContextCtor = window.AudioContext || (window as any).webkitAudioContext
-    const audio = new AudioContextCtor()
-    const notes = id === 'alert' ? [392, 330, 392] : id === 'double' ? [659, 784] : [523, 659]
-    notes.forEach((frequency: number, index: number) => {
-      const oscillator = audio.createOscillator()
-      const gain = audio.createGain()
-      const start = audio.currentTime + index * 0.13
-      oscillator.type = id === 'alert' ? 'square' : 'sine'
-      oscillator.frequency.value = frequency
-      gain.gain.setValueAtTime(0.0001, start)
-      gain.gain.exponentialRampToValueAtTime(0.12 * playbackGain, start + 0.015)
-      gain.gain.exponentialRampToValueAtTime(0.0001, start + 0.11)
-      oscillator.connect(gain).connect(audio.destination)
-      oscillator.start(start)
-      oscillator.stop(start + 0.12)
-    })
-    window.setTimeout(() => void audio.close(), 800)
-  } catch {
-    // Browsers may reject audio before the first user gesture.
-  }
+  const notes = id === 'alert' ? [392, 330, 392] : id === 'double' ? [659, 784] : [523, 659]
+  notes.forEach((frequency: number, index: number) => {
+    const oscillator = audio.createOscillator()
+    const gain = audio.createGain()
+    const start = audio.currentTime + index * 0.13
+    oscillator.type = id === 'alert' ? 'square' : 'sine'
+    oscillator.frequency.value = frequency
+    gain.gain.setValueAtTime(0.0001, start)
+    gain.gain.exponentialRampToValueAtTime(0.12 * playbackGain, start + 0.015)
+    gain.gain.exponentialRampToValueAtTime(0.0001, start + 0.11)
+    oscillator.connect(gain).connect(audio.destination)
+    oscillator.start(start)
+    oscillator.stop(start + 0.12)
+  })
 }
 
 function desktopAttention(): DesktopAttention | undefined {
   return (window as Window & { dshDesktop?: DesktopAttention }).dshDesktop
 }
 
-type SessionSummary = ReturnType<Sessions['list']['getSnapshot']>['byId'][string]
+function notifyReminder(ctx: ClientContext, kind: ReminderKind): void {
+  const preferences = runtimePreferences ?? cloneDefaults()
+  const event = preferences.events[kind]
+  if (!preferences.enabled || !event || isForeground()) return
+  if (event.sound) void playTone(ctx, event.soundId, event.volume).catch(() => {})
+  if (event.flash) void desktopAttention()?.attention?.({ flash: true }).catch(() => {})
+}
+
+function installInteractionReminders(ctx: ClientContext): () => void {
+  const observed = new Set<string>()
+  let lastKind: ReminderKind | undefined
+  let lastAt = 0
+  const notifyOnce = (kind: ReminderKind) => {
+    const now = Date.now()
+    if (lastKind === kind && now - lastAt < 2_000) return
+    lastKind = kind
+    lastAt = now
+    notifyReminder(ctx, kind)
+  }
+  const reconcile = () => {
+    const pending = ctx.uiSession.pendingInteractions.getSnapshot()
+    const current = new Set<string>()
+    for (const interaction of pending.values()) {
+      current.add(interaction.key)
+      if (observed.has(interaction.key)) continue
+      if (interaction.kind === 'approval') notifyOnce('approval')
+      if (interaction.kind === 'question' || interaction.kind === 'plan-review') notifyOnce('question')
+    }
+    observed.clear()
+    for (const key of current) observed.add(key)
+  }
+  // Seed existing interactions without alerting, then alert only on state edges.
+  for (const interaction of ctx.uiSession.pendingInteractions.getSnapshot().values()) observed.add(interaction.key)
+  const dispose = ctx.uiSession.pendingInteractions.subscribe(reconcile)
+  ctx.remote.$on('user-questions/request', async function (_request, next) {
+    notifyOnce('question')
+    return next()
+  })
+  ctx.remote.$on('approval/request', async function (_request, next) {
+    notifyOnce('approval')
+    return next()
+  })
+  return dispose
+}
 
 function eventFor(item: SessionSummary, previous: { running: boolean; pending?: string; goalPhase?: string }): ReminderKind | undefined {
   const pending = item.pendingInteraction
@@ -205,25 +293,20 @@ function eventFor(item: SessionSummary, previous: { running: boolean; pending?: 
 
 function installReminder(ctx: ClientContext): () => void {
   const observed = new Map<string, { running: boolean; pending?: string; goalPhase?: string }>()
-  const notify = (kind: ReminderKind) => {
-    const preferences = runtimePreferences ?? cloneDefaults()
-    const event = preferences.events[kind]
-    if (!preferences.enabled || !event || isForeground()) return
-    if (event.sound) void playTone(ctx, event.soundId, event.volume)
-    if (event.flash) void desktopAttention()?.attention?.({ flash: true }).catch(() => {})
-  }
   const reconcile = async () => {
-    const preferences = await ensurePreferences(ctx)
+    await ensurePreferences(ctx)
     const snapshot = ctx.sessions.list.getSnapshot()
-    for (const sessionId of snapshot.ids) {
-      const item = snapshot.byId[sessionId]
-      if (!item || item.origin === 'subagent') continue
+    // 0.1.2+ provides an item array keyed by sessionId; older runtimes used ids/byId.
+    const entries = snapshot.items ?? (snapshot.ids ?? []).map((id) => snapshot.byId?.[id]).filter((item): item is SessionSummary => item !== undefined)
+    for (const item of entries) {
+      const sessionId = item.sessionId ?? item.id
+      if (!sessionId || item.origin === 'subagent') continue
       const prior = observed.get(sessionId)
       const goal = item.projectionValues?.goal as { phase?: string } | undefined
       const current = { running: item.running, pending: item.pendingInteraction, goalPhase: goal?.phase }
       if (prior) {
         const kind = eventFor(item, prior)
-        if (kind) notify(kind)
+        if (kind) notifyReminder(ctx, kind)
       }
       observed.set(sessionId, current)
     }
@@ -235,10 +318,10 @@ function installReminder(ctx: ClientContext): () => void {
 const LOCALE_NS = 'dsh-reminder'
 const messages = {
   zh: {
-    title: 'DSH 提醒', description: '在 DSH Desktop 不在前台或最小化时提醒一次。', statusReady: '当前 DSH Desktop 支持任务栏闪烁。', statusSoundOnly: '当前安装缺少任务栏桥接，将使用声音提醒。', enabled: '启用提醒', sound: '提示音', flash: '任务栏闪烁', volume: '音量', test: '试听', importTone: '导入 MP3/WAV', importing: '正在导入...', importFailed: '导入失败', importedTones: '已导入提示音', chime: '提示音', double: '双音提示', alert: '警示音', silent: '静音', approval: '等待权限或高风险操作确认', question: '等待回答澄清问题', completed: '主任务完成', failed: '主任务失败或阻塞', expand: '展开', collapse: '收起'
+    title: 'DSH 提醒', description: '在 DSH Desktop 不在前台或最小化时提醒一次。', statusReady: '当前 DSH Desktop 支持任务栏闪烁。', statusSoundOnly: '当前安装缺少任务栏桥接，将使用声音提醒。', audioReady: '声音提醒已就绪。', audioBlocked: '请先点击“试听”一次以启用声音提醒。', enabled: '启用提醒', sound: '提示音', flash: '任务栏闪烁', volume: '音量', test: '试听', audioFailed: '无法播放提示音，请检查系统音量并再次点击试听。', importTone: '导入 MP3/WAV', importing: '正在导入...', importFailed: '导入失败', importedTones: '已导入提示音', chime: '提示音', double: '双音提示', alert: '警示音', silent: '静音', approval: '等待权限或高风险操作确认', question: '等待回答澄清问题', completed: '主任务完成', failed: '主任务失败或阻塞', expand: '展开', collapse: '收起'
   },
   en: {
-    title: 'DSH Reminder', description: 'Alert once when DSH Desktop is unfocused or minimized.', statusReady: 'Taskbar flashing is available in this DSH Desktop installation.', statusSoundOnly: 'The taskbar bridge is unavailable; sound reminders are active.', enabled: 'Enable reminders', sound: 'Sound', flash: 'Flash taskbar', volume: 'Volume', test: 'Test sound', importTone: 'Import MP3/WAV', importing: 'Importing...', importFailed: 'Import failed', importedTones: 'Imported tones', chime: 'Chime', double: 'Double chime', alert: 'Alert', silent: 'Silent', approval: 'Waiting for permission or high-risk confirmation', question: 'Waiting for your answer', completed: 'Main task completed', failed: 'Main task failed or blocked', expand: 'Expand', collapse: 'Collapse'
+    title: 'DSH Reminder', description: 'Alert once when DSH Desktop is unfocused or minimized.', statusReady: 'Taskbar flashing is available in this DSH Desktop installation.', statusSoundOnly: 'The taskbar bridge is unavailable; sound reminders are active.', audioReady: 'Sound reminders are ready.', audioBlocked: 'Click “Test sound” once to enable sound reminders.', enabled: 'Enable reminders', sound: 'Sound', flash: 'Flash taskbar', volume: 'Volume', test: 'Test sound', audioFailed: 'The tone could not play. Check system volume and try Test sound again.', importTone: 'Import MP3/WAV', importing: 'Importing...', importFailed: 'Import failed', importedTones: 'Imported tones', chime: 'Chime', double: 'Double chime', alert: 'Alert', silent: 'Silent', approval: 'Waiting for permission or high-risk confirmation', question: 'Waiting for your answer', completed: 'Main task completed', failed: 'Main task failed or blocked', expand: 'Expand', collapse: 'Collapse'
   }
 } as const
 
@@ -248,6 +331,7 @@ function ReminderSettingsDom(ctx: ClientContext, t: (key: LocaleKey) => string):
   let preferences = runtimePreferences ?? cloneDefaults()
   let importedTones: ImportedTone[] = []
   let importError = ''
+  let audioError = ''
   const root = document.createElement('section')
   root.className = 'dsh-reminder-settings'
   root.innerHTML = `
@@ -324,7 +408,8 @@ function ReminderSettingsDom(ctx: ClientContext, t: (key: LocaleKey) => string):
   }
   const render = () => {
     const attentionAvailable = typeof desktopAttention()?.attention === 'function'
-    ;(root.querySelector('.status') as HTMLElement).textContent = attentionAvailable ? t('statusReady') : t('statusSoundOnly')
+    const status = root.querySelector('.status') as HTMLElement
+    status.textContent = audioError || (audioUnlocked ? t('audioReady') : `${attentionAvailable ? t('statusReady') : t('statusSoundOnly')} ${t('audioBlocked')}`)
     const master = root.querySelector('.master') as HTMLLabelElement
     master.lastChild!.textContent = t('enabled')
     const masterInput = master.querySelector('input') as HTMLInputElement
@@ -372,7 +457,13 @@ function ReminderSettingsDom(ctx: ClientContext, t: (key: LocaleKey) => string):
       const test = document.createElement('button')
       test.type = 'button'
       test.textContent = t('test')
-      test.onclick = () => { void playTone(ctx, pref.soundId, pref.volume) }
+      test.onclick = () => {
+        audioError = ''
+        void playTone(ctx, pref.soundId, pref.volume).then(() => render()).catch(() => {
+          audioError = t('audioFailed')
+          render()
+        })
+      }
       ;(sound.querySelector('input') as HTMLInputElement).onchange = (event) => { pref.sound = (event.target as HTMLInputElement).checked; persist() }
       ;(flash.querySelector('input') as HTMLInputElement).onchange = (event) => { pref.flash = (event.target as HTMLInputElement).checked; persist() }
       select.onchange = () => { pref.soundId = select.value as SoundId; persist() }
@@ -432,11 +523,13 @@ function ReminderSettings(props: { ctx: ClientContext; t: (key: LocaleKey) => st
   return React.createElement('div', { ref: container })
 }
 
-export const inject = ['slots', 'locale', 'sessions', 'connection']
+export const inject = ['slots', 'locale', 'sessions', 'remote', 'uiSession', 'connection']
 
 export function apply(ctx: ClientContext): void {
   const t = ctx.locale.bind(LOCALE_NS)
   ctx.effect(() => ctx.locale.register(LOCALE_NS, messages), 'dsh-reminder: locale')
+  installInteractionReminders(ctx)
+  ctx.effect(() => installAudioUnlock(), 'dsh-reminder: audio unlock')
   ctx.effect(() => installReminder(ctx), 'dsh-reminder: session status watcher')
   ctx.effect(() => ctx.slots.inject('settings.plugin.item', () => ctx.slots.register({
     name: 'settings.plugin.item',
