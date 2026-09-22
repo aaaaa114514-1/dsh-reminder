@@ -18,12 +18,16 @@ type SoundId = BuiltInSoundId | `imported:${string}`
 type EventPreference = {
   sound: boolean
   flash: boolean
+  popup: boolean
   soundId: SoundId
   volume: number
 }
 
+type ReminderMode = 'off' | 'background' | 'always'
+
 type Preferences = {
   enabled: boolean
+  mode: ReminderMode
   events: Record<ReminderKind, EventPreference>
 }
 
@@ -145,13 +149,22 @@ async function importedToneBuffer(ctx: ClientContext, id: string): Promise<Audio
   return buffer
 }
 
+const MODE_VALUES: ReminderMode[] = ['off', 'background', 'always']
+
+function modeFromSaved(saved: Partial<Preferences> | undefined): ReminderMode {
+  if (saved?.mode === 'off' || saved?.mode === 'background' || saved?.mode === 'always') return saved.mode
+  if (saved?.enabled === false) return 'off'
+  return 'background'
+}
+
 const defaults: Preferences = {
   enabled: true,
+  mode: 'background',
   events: {
-    approval: { sound: true, flash: true, soundId: 'alert', volume: 0.5 },
-    question: { sound: true, flash: true, soundId: 'double', volume: 0.5 },
-    completed: { sound: true, flash: true, soundId: 'chime', volume: 0.5 },
-    failed: { sound: true, flash: true, soundId: 'alert', volume: 0.5 },
+    approval: { sound: true, flash: true, popup: true, soundId: 'alert', volume: 0.5 },
+    question: { sound: true, flash: true, popup: true, soundId: 'double', volume: 0.5 },
+    completed: { sound: true, flash: true, popup: true, soundId: 'chime', volume: 0.5 },
+    failed: { sound: true, flash: true, popup: true, soundId: 'alert', volume: 0.5 },
   },
 }
 
@@ -160,11 +173,14 @@ function cloneDefaults(): Preferences {
 }
 
 function mergePreferences(saved: Partial<Preferences> | undefined): Preferences {
+  const mode = modeFromSaved(saved)
   return {
-    enabled: saved?.enabled ?? defaults.enabled,
+    enabled: mode !== 'off',
+    mode,
     events: Object.fromEntries((Object.keys(defaults.events) as ReminderKind[]).map((kind) => [kind, {
       ...defaults.events[kind],
       ...saved?.events?.[kind],
+      popup: saved?.events?.[kind]?.popup ?? defaults.events[kind].popup,
       volume: typeof saved?.events?.[kind]?.volume === 'number' ? Math.max(0, Math.min(1, saved.events[kind]!.volume)) : defaults.events[kind].volume,
     }])) as Preferences['events'],
   }
@@ -183,9 +199,10 @@ async function ensurePreferences(ctx: ClientContext): Promise<Preferences> {
   if (runtimePreferences) return runtimePreferences
   preferencesReady ??= reminderRpc<Partial<Preferences> | undefined>(ctx, 'preferences', {}).then((saved) => {
     const local = loadLocalPreferences()
-    runtimePreferences = mergePreferences(saved ?? local)
-    const needsMigration = !saved || (Object.keys(defaults.events) as ReminderKind[]).some((kind) => typeof saved.events?.[kind]?.volume !== 'number')
-    if (needsMigration) return reminderRpc(ctx, 'savePreferences', runtimePreferences).then(() => undefined)
+    const merged = mergePreferences(saved ?? local)
+    runtimePreferences = merged
+    const needsMigration = !saved || saved.mode !== merged.mode || (Object.keys(defaults.events) as ReminderKind[]).some((kind) => typeof saved.events?.[kind]?.volume !== 'number' || typeof saved.events?.[kind]?.popup !== 'boolean')
+    if (needsMigration) return reminderRpc(ctx, 'savePreferences', merged).then(() => undefined)
     return undefined
   }).catch(() => {
     runtimePreferences = loadLocalPreferences() ?? cloneDefaults()
@@ -234,12 +251,47 @@ function desktopAttention(): DesktopAttention | undefined {
   return (window as Window & { dshDesktop?: DesktopAttention }).dshDesktop
 }
 
+const POPUP_TITLES: Record<ReminderKind, { zh: string; en: string }> = {
+  approval: { zh: 'DSH 等待确认', en: 'DSH is waiting for confirmation' },
+  question: { zh: 'DSH 等待回答', en: 'DSH is waiting for your answer' },
+  completed: { zh: 'DSH 任务已完成', en: 'DSH task completed' },
+  failed: { zh: 'DSH 任务失败或阻塞', en: 'DSH task failed or blocked' },
+}
+
+function popupLocale(): 'zh' | 'en' {
+  const language = document.documentElement.lang || navigator.language || ''
+  return language.toLowerCase().startsWith('zh') ? 'zh' : 'en'
+}
+
+function popupCopy(kind: ReminderKind): { title: string; body: string } {
+  const locale = popupLocale()
+  return {
+    title: POPUP_TITLES[kind][locale],
+    body: locale === 'zh' ? '请查看 DSH Desktop。' : 'Open DSH Desktop for details.',
+  }
+}
+
+function showPopup(ctx: ClientContext, kind: ReminderKind): Promise<void> {
+  const copy = popupCopy(kind)
+  return reminderRpc(ctx, 'notify', copy).then(() => undefined)
+}
+
+function showFlash(ctx: ClientContext, force = false): Promise<void> {
+  return reminderRpc(ctx, 'flash', { force }).then(() => undefined)
+}
+
 function notifyReminder(ctx: ClientContext, kind: ReminderKind): void {
   const preferences = runtimePreferences ?? cloneDefaults()
   const event = preferences.events[kind]
-  if (!preferences.enabled || !event || isForeground()) return
+  if (preferences.mode === 'off' || !event) return
+  const foreground = isForeground()
+  if (preferences.mode === 'background' && foreground) return
   if (event.sound) void playTone(ctx, event.soundId, event.volume).catch(() => {})
-  if (event.flash) void desktopAttention()?.attention?.({ flash: true }).catch(() => {})
+  if (event.popup) void showPopup(ctx, kind).catch(() => {})
+  if (event.flash) {
+    void desktopAttention()?.attention?.({ flash: true }).catch(() => {})
+    void showFlash(ctx, preferences.mode === 'always' && foreground).catch(() => {})
+  }
 }
 
 function installInteractionReminders(ctx: ClientContext): () => void {
@@ -318,10 +370,10 @@ function installReminder(ctx: ClientContext): () => void {
 const LOCALE_NS = 'dsh-reminder'
 const messages = {
   zh: {
-    title: 'DSH 提醒', description: '在 DSH Desktop 不在前台或最小化时提醒一次。', statusReady: '当前 DSH Desktop 支持任务栏闪烁。', statusSoundOnly: '当前安装缺少任务栏桥接，将使用声音提醒。', audioReady: '声音提醒已就绪。', audioBlocked: '请先点击“试听”一次以启用声音提醒。', enabled: '启用提醒', sound: '提示音', flash: '任务栏闪烁', volume: '音量', test: '试听', audioFailed: '无法播放提示音，请检查系统音量并再次点击试听。', importTone: '导入 MP3/WAV', importing: '正在导入...', importFailed: '导入失败', importedTones: '已导入提示音', chime: '提示音', double: '双音提示', alert: '警示音', silent: '静音', approval: '等待权限或高风险操作确认', question: '等待回答澄清问题', completed: '主任务完成', failed: '主任务失败或阻塞', expand: '展开', collapse: '收起'
+    title: 'DSH 提醒', description: '在主会话需要处理时按下方勾选提醒一次。', statusReady: '声音、系统通知和任务栏闪烁都可用。', statusSoundOnly: '声音、系统通知和任务栏闪烁都可用。', audioReady: '声音提醒已就绪。勾选“系统通知”后，试听会在屏幕右下角弹出 Windows 通知。勾选“任务栏闪烁”后，试听会闪任务栏图标。', audioBlocked: '请先点击“试听”一次以启用声音提醒。', popupHint: '系统通知会出现在屏幕右下角。任务栏闪烁会点亮任务栏里的 DSH 图标。', popupSent: '已发送系统通知，请看屏幕右下角。', popupFailed: '系统通知未能弹出。请检查 Windows 通知设置，并关闭专注助手。', flashSent: '已请求任务栏闪烁，请看任务栏中的 DSH 图标。', flashFailed: '任务栏未能闪烁。', modeTitle: '提醒时机', modeOff: '关闭', modeBackground: '仅后台', modeAlways: '始终', modeOffHint: '不发出任何提醒。', modeBackgroundHint: '仅当 DSH 不在前台或已最小化时提醒。', modeAlwaysHint: '即使 DSH 已经在最前面，也会按下方勾选发出提醒。', sound: '提示音', popup: '系统通知', flash: '任务栏闪烁', volume: '音量', test: '试听', audioFailed: '无法播放提示音，请检查系统音量并再次点击试听。', importTone: '导入 MP3/WAV', importing: '正在导入...', importFailed: '导入失败', importedTones: '已导入提示音', chime: '提示音', double: '双音提示', alert: '警示音', silent: '静音', approval: '等待权限或高风险操作确认', question: '等待回答澄清问题', completed: '主任务完成', failed: '主任务失败或阻塞', expand: '展开', collapse: '收起'
   },
   en: {
-    title: 'DSH Reminder', description: 'Alert once when DSH Desktop is unfocused or minimized.', statusReady: 'Taskbar flashing is available in this DSH Desktop installation.', statusSoundOnly: 'The taskbar bridge is unavailable; sound reminders are active.', audioReady: 'Sound reminders are ready.', audioBlocked: 'Click “Test sound” once to enable sound reminders.', enabled: 'Enable reminders', sound: 'Sound', flash: 'Flash taskbar', volume: 'Volume', test: 'Test sound', audioFailed: 'The tone could not play. Check system volume and try Test sound again.', importTone: 'Import MP3/WAV', importing: 'Importing...', importFailed: 'Import failed', importedTones: 'Imported tones', chime: 'Chime', double: 'Double chime', alert: 'Alert', silent: 'Silent', approval: 'Waiting for permission or high-risk confirmation', question: 'Waiting for your answer', completed: 'Main task completed', failed: 'Main task failed or blocked', expand: 'Expand', collapse: 'Collapse'
+    title: 'DSH Reminder', description: 'Alert once when a main session needs attention, according to the switches below.', statusReady: 'Sound, system notifications, and taskbar flashing are available.', statusSoundOnly: 'Sound, system notifications, and taskbar flashing are available.', audioReady: 'Sound reminders are ready. With “System notification” on, Test sound also shows a Windows toast. With “Flash taskbar” on, it flashes the DSH taskbar icon.', audioBlocked: 'Click “Test sound” once to enable sound reminders.', popupHint: 'System notifications appear at the bottom-right. Taskbar flashing lights the DSH icon.', popupSent: 'A system notification was sent. Look at the bottom-right of the screen.', popupFailed: 'The system notification could not be shown. Check Windows notification settings and turn off Focus Assist.', flashSent: 'Taskbar flashing was requested. Look at the DSH icon on the taskbar.', flashFailed: 'The taskbar could not flash.', modeTitle: 'When to remind', modeOff: 'Off', modeBackground: 'Background only', modeAlways: 'Always', modeOffHint: 'Do not send any reminders.', modeBackgroundHint: 'Remind only when DSH is unfocused or minimized.', modeAlwaysHint: 'Remind even when DSH is already in the foreground.', sound: 'Sound', popup: 'System notification', flash: 'Flash taskbar', volume: 'Volume', test: 'Test sound', audioFailed: 'The tone could not play. Check system volume and try Test sound again.', importTone: 'Import MP3/WAV', importing: 'Importing...', importFailed: 'Import failed', importedTones: 'Imported tones', chime: 'Chime', double: 'Double chime', alert: 'Alert', silent: 'Silent', approval: 'Waiting for permission or high-risk confirmation', question: 'Waiting for your answer', completed: 'Main task completed', failed: 'Main task failed or blocked', expand: 'Expand', collapse: 'Collapse'
   }
 } as const
 
@@ -332,6 +384,7 @@ function ReminderSettingsDom(ctx: ClientContext, t: (key: LocaleKey) => string):
   let importedTones: ImportedTone[] = []
   let importError = ''
   let audioError = ''
+  let popupStatus = ''
   const root = document.createElement('section')
   root.className = 'dsh-reminder-settings'
   root.innerHTML = `
@@ -345,9 +398,22 @@ function ReminderSettingsDom(ctx: ClientContext, t: (key: LocaleKey) => string):
       .dsh-reminder-settings .chevron { color: var(--dsw-alias-label-tertiary); transition: transform .16s; }
       .dsh-reminder-settings .chevron.open { transform: rotate(180deg); }
       .dsh-reminder-settings .body { border-top: 1px solid var(--dsw-alias-border-l2); margin: 0 16px; padding: 12px 0 8px; }
-      .dsh-reminder-settings .status { margin: 0 0 12px; color: var(--dsw-alias-label-tertiary); font-size: 12px; line-height: 1.5; }
-      .dsh-reminder-settings .master { display: block; margin-bottom: 12px; font-size: 13px; }
-      .dsh-reminder-settings .event { display: grid; grid-template-columns: minmax(0, 1fr) auto auto; gap: 10px; align-items: center; border-top: 1px solid var(--dsw-alias-border-l2); padding: 12px 0; }
+      .dsh-reminder-settings .status { margin: 0 0 12px; color: var(--dsw-alias-label-tertiary); font-size: 12px; line-height: 1.5; white-space: pre-wrap; }
+      .dsh-reminder-settings .preview { display: none; margin: 0 0 12px; padding: 10px 12px; border: 1px solid var(--dsw-alias-border-l2); border-radius: 10px; background: var(--dsw-alias-bg-layer-2, transparent); }
+      .dsh-reminder-settings .preview.show { display: block; }
+      .dsh-reminder-settings .preview-title { font-size: 13px; font-weight: 600; }
+      .dsh-reminder-settings .preview-body { margin-top: 4px; color: var(--dsw-alias-label-tertiary); font-size: 12px; }
+      .dsh-reminder-settings .mode { margin: 0 0 14px; }
+      .dsh-reminder-settings .mode-title { display: block; margin-bottom: 8px; font-size: 13px; }
+      .dsh-reminder-settings .mode-slider { width: 100%; margin: 0; accent-color: var(--dsw-alias-label-brand, #6f86ff); }
+      .dsh-reminder-settings .mode-ticks { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 8px; margin-top: 6px; }
+      .dsh-reminder-settings .mode-ticks button { padding: 0; border: 0; background: transparent; color: var(--dsw-alias-label-tertiary); font: inherit; font-size: 12px; cursor: pointer; }
+      .dsh-reminder-settings .mode-ticks button:nth-child(1) { text-align: left; }
+      .dsh-reminder-settings .mode-ticks button:nth-child(2) { text-align: center; }
+      .dsh-reminder-settings .mode-ticks button:nth-child(3) { text-align: right; }
+      .dsh-reminder-settings .mode-ticks button.active { color: var(--dsw-alias-label-primary); font-weight: 600; }
+      .dsh-reminder-settings .mode-hint { margin: 6px 0 0; color: var(--dsw-alias-label-tertiary); font-size: 12px; line-height: 1.5; }
+      .dsh-reminder-settings .event { display: grid; grid-template-columns: minmax(0, 1fr) auto auto auto; gap: 10px; align-items: center; border-top: 1px solid var(--dsw-alias-border-l2); padding: 12px 0; }
       .dsh-reminder-settings .event-name { min-width: 0; font-size: 13px; }
       .dsh-reminder-settings .event-controls { grid-column: 1 / -1; display: grid; grid-template-columns: minmax(0, 1fr) minmax(120px, 0.7fr) auto; gap: 10px; align-items: center; }
       .dsh-reminder-settings .event-controls select { min-width: 0; width: 100%; }
@@ -356,9 +422,11 @@ function ReminderSettingsDom(ctx: ClientContext, t: (key: LocaleKey) => string):
       .dsh-reminder-settings .volume-value { min-width: 34px; text-align: right; font-variant-numeric: tabular-nums; }
       .dsh-reminder-settings label { font-size: 13px; }
       .dsh-reminder-settings select, .dsh-reminder-settings button { font: inherit; }
-      .dsh-reminder-settings button { padding: 5px 9px; border: 1px solid var(--dsw-alias-border-l2); border-radius: 6px; color: inherit; background: transparent; cursor: pointer; }
-      .dsh-reminder-settings input[type=file] { display: none; }
-      @media (max-width: 650px) { .dsh-reminder-settings .event { grid-template-columns: 1fr auto auto; } }
+      .dsh-reminder-settings button, .dsh-reminder-settings .import-button { padding: 5px 9px; border: 1px solid var(--dsw-alias-border-l2); border-radius: 6px; color: inherit; background: transparent; cursor: pointer; display: inline-block; }
+      .dsh-reminder-settings .imports { display: flex; align-items: center; gap: 10px; margin-bottom: 8px; }
+      .dsh-reminder-settings .import-error { color: var(--dsw-alias-label-danger, #d54848); font-size: 12px; }
+      .dsh-reminder-settings input[type=file] { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0, 0, 0, 0); border: 0; }
+      @media (max-width: 720px) { .dsh-reminder-settings .event { grid-template-columns: 1fr auto auto; } .dsh-reminder-settings .event label:nth-of-type(3) { grid-column: 2; } }
     </style>
     <div class="card">
       <button class="header" type="button" aria-expanded="false">
@@ -367,7 +435,20 @@ function ReminderSettingsDom(ctx: ClientContext, t: (key: LocaleKey) => string):
       </button>
       <div class="body" hidden>
         <div class="status"></div>
-        <label class="master"><input type="checkbox"> </label>
+        <div class="preview" hidden>
+          <div class="preview-title"></div>
+          <div class="preview-body"></div>
+        </div>
+        <div class="mode">
+          <span class="mode-title"></span>
+          <input class="mode-slider" type="range" min="0" max="2" step="1">
+          <div class="mode-ticks">
+            <button type="button" data-mode="off"></button>
+            <button type="button" data-mode="background"></button>
+            <button type="button" data-mode="always"></button>
+          </div>
+          <div class="mode-hint"></div>
+        </div>
         <div class="imports"></div>
         <div class="events"></div>
       </div>
@@ -394,8 +475,9 @@ function ReminderSettingsDom(ctx: ClientContext, t: (key: LocaleKey) => string):
   }
   const importFile = document.createElement('input')
   importFile.type = 'file'
-  importFile.accept = '.mp3,.wav,audio/mpeg,audio/wav'
-  importFile.hidden = true
+  importFile.accept = '.mp3,.wav,audio/mpeg,audio/mp3,audio/wav,audio/x-wav,audio/wave,audio/*'
+  importFile.id = 'dsh-reminder-import-file'
+  root.append(importFile)
   const refreshTones = async () => {
     try {
       importedTones = await reminderRpc<ImportedTone[]>(ctx, 'tones', {})
@@ -407,14 +489,34 @@ function ReminderSettingsDom(ctx: ClientContext, t: (key: LocaleKey) => string):
     }
   }
   const render = () => {
-    const attentionAvailable = typeof desktopAttention()?.attention === 'function'
     const status = root.querySelector('.status') as HTMLElement
-    status.textContent = audioError || (audioUnlocked ? t('audioReady') : `${attentionAvailable ? t('statusReady') : t('statusSoundOnly')} ${t('audioBlocked')}`)
-    const master = root.querySelector('.master') as HTMLLabelElement
-    master.lastChild!.textContent = t('enabled')
-    const masterInput = master.querySelector('input') as HTMLInputElement
-    masterInput.checked = preferences.enabled
-    masterInput.onchange = () => { preferences.enabled = masterInput.checked; persist() }
+    status.textContent = audioError || popupStatus || `${audioUnlocked ? t('audioReady') : `${t('statusReady')} ${t('audioBlocked')}`}\n${t('popupHint')}`
+    const preview = root.querySelector('.preview') as HTMLElement
+    preview.classList.toggle('show', Boolean(popupStatus && popupStatus === t('popupSent')))
+    preview.hidden = !preview.classList.contains('show')
+    const modeTitle = root.querySelector('.mode-title') as HTMLElement
+    const modeSlider = root.querySelector('.mode-slider') as HTMLInputElement
+    const modeHint = root.querySelector('.mode-hint') as HTMLElement
+    const modeHints: Record<ReminderMode, LocaleKey> = { off: 'modeOffHint', background: 'modeBackgroundHint', always: 'modeAlwaysHint' }
+    modeTitle.textContent = t('modeTitle')
+    modeSlider.value = String(MODE_VALUES.indexOf(preferences.mode))
+    modeSlider.setAttribute('aria-label', t('modeTitle'))
+    modeHint.textContent = t(modeHints[preferences.mode])
+    modeSlider.oninput = () => {
+      preferences.mode = MODE_VALUES[Number(modeSlider.value)] ?? 'background'
+      preferences.enabled = preferences.mode !== 'off'
+      persist()
+    }
+    root.querySelectorAll('.mode-ticks button').forEach((button) => {
+      const mode = (button as HTMLButtonElement).dataset.mode as ReminderMode
+      button.textContent = t(mode === 'off' ? 'modeOff' : mode === 'always' ? 'modeAlways' : 'modeBackground')
+      button.classList.toggle('active', mode === preferences.mode)
+      ;(button as HTMLButtonElement).onclick = () => {
+        preferences.mode = mode
+        preferences.enabled = mode !== 'off'
+        persist()
+      }
+    })
     const events = root.querySelector('.events') as HTMLElement
     events.replaceChildren()
     for (const kind of Object.keys(kinds) as ReminderKind[]) {
@@ -423,8 +525,10 @@ function ReminderSettingsDom(ctx: ClientContext, t: (key: LocaleKey) => string):
       row.className = 'event'
       const sound = document.createElement('label')
       sound.innerHTML = `<input type="checkbox" ${pref.sound ? 'checked' : ''}> ${t('sound')}`
+      const popup = document.createElement('label')
+      popup.innerHTML = `<input type="checkbox" ${pref.popup ? 'checked' : ''}> ${t('popup')}`
       const flash = document.createElement('label')
-      flash.innerHTML = `<input type="checkbox" ${pref.flash ? 'checked' : ''} ${attentionAvailable ? '' : 'disabled'}> ${t('flash')}`
+      flash.innerHTML = `<input type="checkbox" ${pref.flash ? 'checked' : ''}> ${t('flash')}`
       const select = document.createElement('select')
       for (const [value, key] of [['chime', 'chime'], ['double', 'double'], ['alert', 'alert'], ['none', 'silent']] as Array<[BuiltInSoundId, LocaleKey]>) select.add(new Option(t(key), value, false, pref.soundId === value))
       if (importedTones.length) {
@@ -459,12 +563,34 @@ function ReminderSettingsDom(ctx: ClientContext, t: (key: LocaleKey) => string):
       test.textContent = t('test')
       test.onclick = () => {
         audioError = ''
-        void playTone(ctx, pref.soundId, pref.volume).then(() => render()).catch(() => {
+        popupStatus = ''
+        render()
+        const jobs: Array<Promise<void>> = []
+        if (pref.popup) {
+          const copy = popupCopy(kind)
+          const preview = root.querySelector('.preview') as HTMLElement
+          ;(preview.querySelector('.preview-title') as HTMLElement).textContent = copy.title
+          ;(preview.querySelector('.preview-body') as HTMLElement).textContent = copy.body
+          jobs.push(showPopup(ctx, kind).then(() => {
+            popupStatus = t('popupSent')
+          }).catch((error) => {
+            popupStatus = error instanceof Error && error.message ? `${t('popupFailed')} ${error.message}` : t('popupFailed')
+          }))
+        }
+        if (pref.flash) {
+          jobs.push(showFlash(ctx, true).then(() => {
+            if (!popupStatus) popupStatus = t('flashSent')
+          }).catch((error) => {
+            if (!popupStatus) popupStatus = error instanceof Error && error.message ? `${t('flashFailed')} ${error.message}` : t('flashFailed')
+          }))
+        }
+        jobs.push(playTone(ctx, pref.soundId, pref.volume).catch(() => {
           audioError = t('audioFailed')
-          render()
-        })
+        }))
+        void Promise.allSettled(jobs).then(() => render())
       }
       ;(sound.querySelector('input') as HTMLInputElement).onchange = (event) => { pref.sound = (event.target as HTMLInputElement).checked; persist() }
+      ;(popup.querySelector('input') as HTMLInputElement).onchange = (event) => { pref.popup = (event.target as HTMLInputElement).checked; persist() }
       ;(flash.querySelector('input') as HTMLInputElement).onchange = (event) => { pref.flash = (event.target as HTMLInputElement).checked; persist() }
       select.onchange = () => { pref.soundId = select.value as SoundId; persist() }
       const name = document.createElement('span')
@@ -473,15 +599,19 @@ function ReminderSettingsDom(ctx: ClientContext, t: (key: LocaleKey) => string):
       const controls = document.createElement('div')
       controls.className = 'event-controls'
       controls.append(select, volume, test)
-      row.append(name, sound, flash, controls)
+      row.append(name, sound, popup, flash, controls)
       events.append(row)
     }
     const importRow = root.querySelector('.imports') as HTMLElement
     importRow.replaceChildren()
-    const importButton = document.createElement('button')
-    importButton.type = 'button'
+    const importButton = document.createElement('label')
+    importButton.className = 'import-button'
+    importButton.htmlFor = importFile.id
     importButton.textContent = t('importTone')
-    importButton.onclick = () => importFile.click()
+    importButton.onclick = (event) => {
+      event.preventDefault()
+      importFile.click()
+    }
     importRow.append(importButton)
     if (importError) {
       const error = document.createElement('span')
@@ -496,11 +626,12 @@ function ReminderSettingsDom(ctx: ClientContext, t: (key: LocaleKey) => string):
     if (!file) return
     try {
       importError = ''
+      render()
       const data = base64FromBytes(new Uint8Array(await file.arrayBuffer()))
-      await reminderRpc(ctx, 'importTone', { name: file.name, data })
+      await reminderRpc(ctx, 'importTone', { name: file.name, data, mime: file.type })
       await refreshTones()
-    } catch {
-      importError = t('importFailed')
+    } catch (error) {
+      importError = error instanceof Error && error.message ? error.message : t('importFailed')
       render()
     }
   }

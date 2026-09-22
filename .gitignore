@@ -27,6 +27,9 @@ Agent.md
 Thumbs.db
 Desktop.ini
 
+# Local rollback snapshots for safe reloads
+.rollback/
+
 # Diagnostic output
 *.log
 npm-debug.log*

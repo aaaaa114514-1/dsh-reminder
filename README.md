@@ -2,7 +2,7 @@
 
 [简体中文](README.zh-CN.md)
 
-A Windows DSH Desktop plugin that plays a one-time reminder when a main session needs attention while DSH is not in the foreground.
+A Windows DSH Desktop plugin that plays a one-time reminder, and can also show a Windows notification, when a main session needs attention while DSH is not in the foreground.
 
 ## Reminders
 
@@ -19,10 +19,10 @@ It does not remind for long-running work alone, repeated unchanged states, or su
 
 Open **Settings -> Plugins -> DSH Reminder** to configure:
 
-- A master enable switch.
-- Sound and taskbar-flash switches for each reminder event.
+- A three-position timing slider: off, background only, or always.
+- Sound, system-notification, and taskbar-flash switches for each reminder event.
 - Built-in tones or imported MP3/WAV files for each event.
-- A separate volume control and preview button for every event.
+- A separate volume control and preview button for every event. Preview also shows a test notification and flashes the taskbar when those switches are on.
 
 The 50% volume setting matches the original default reminder loudness. Imported tones and event preferences persist across DSH restarts. After a plugin reload or a DSH restart, click a preview button once to prepare browser audio for background reminders.
 
@@ -34,7 +34,7 @@ Use **Import MP3/WAV** in the plugin settings card to add a local audio file. Th
 
 This plugin targets Windows DSH Desktop.
 
-Sound reminders work in the renderer. Native Windows taskbar flashing requires the optional Desktop `dshDesktop.attention({ flash })` bridge. When that bridge is unavailable, taskbar-flash controls are disabled and sound reminders remain available.
+Sound reminders work in the renderer. System notifications use a Windows toast (with a balloon-tip fallback) from the plugin host. They appear at the bottom-right of the screen, not inside the settings card. Taskbar flashing uses Win32 `FlashWindowEx` against the live DSH Desktop window, so it no longer depends on a Desktop `dshDesktop.attention` bridge. Clicking **Test sound** with those switches enabled also shows a test toast and flashes the taskbar icon a few times. Windows Focus Assist / Do Not Disturb can still hide toasts.
 
 ## Development
 
