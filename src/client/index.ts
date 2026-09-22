@@ -57,16 +57,32 @@ type SessionListSnapshot = {
   items?: SessionSummary[]
 }
 
+type SessionEvent = { type?: string; seq?: number; data?: { reason?: { kind?: string } } }
+type SessionEventEntry = { type?: string; event?: SessionEvent }
+type SessionFace = {
+  getSnapshot(): { running?: boolean; lastAgentError?: string | null; promptError?: unknown }
+  subscribe(listener: () => void): () => void
+}
+type SessionEventSource = {
+  getSnapshot(): { entries: SessionEventEntry[] }
+  subscribe(listener: () => void): () => void
+}
+type SessionBinding = {
+  session: SessionFace
+  eventSource: SessionEventSource
+}
+
 type Sessions = {
   list: {
     getSnapshot(): SessionListSnapshot
     subscribe(listener: () => void): () => void
   }
+  binding?(id: string): SessionBinding | undefined
 }
 
 type Remote = {
-  $on(event: 'user-questions/request' | 'approval/request', listener: (this: unknown, request: unknown, next: () => Promise<unknown>) => Promise<unknown>): void
-  $on(event: 'api-session/error', listener: (sessionId: string, message: string) => void): void
+  $on(event: 'user-questions/request' | 'approval/request', listener: (this: unknown, request: unknown, next: () => Promise<unknown>) => Promise<unknown>): void | (() => void)
+  $on(event: 'api-session/error', listener: (...args: unknown[]) => void): void | (() => void)
 }
 
 type PendingInteraction = { key: string; kind: 'approval' | 'question' | 'plan-review' | string }
@@ -332,8 +348,7 @@ function installInteractionReminders(ctx: ClientContext): () => void {
   return dispose
 }
 
-const FAILED_TURN_WINDOW_MS = 15_000
-const IDLE_CLASSIFY_MS = 800
+const IDLE_CLASSIFY_MS = 1_200
 
 type ObservedSession = {
   running: boolean
@@ -351,6 +366,48 @@ function sessionOrigin(snapshot: SessionListSnapshot, sessionId: string): string
   return item?.origin
 }
 
+function lastTurnEnd(binding: SessionBinding | undefined): { seq?: number; kind?: string } | undefined {
+  try {
+    const entries = binding?.eventSource.getSnapshot().entries ?? []
+    for (let index = entries.length - 1; index >= 0; index -= 1) {
+      const event = entries[index]?.event
+      if (event?.type !== 'turn/end') continue
+      return { seq: event.seq, kind: event.data?.reason?.kind }
+    }
+  } catch {}
+  return undefined
+}
+
+function bindingOf(ctx: ClientContext, sessionId: string): SessionBinding | undefined {
+  try {
+    return ctx.sessions.binding?.(sessionId)
+  } catch {
+    return undefined
+  }
+}
+
+function hasAgentFailure(binding: SessionBinding | undefined): boolean {
+  try {
+    const snapshot = binding?.session.getSnapshot()
+    if (snapshot?.lastAgentError) return true
+    if (snapshot?.promptError) return true
+  } catch {}
+  const kind = lastTurnEnd(binding)?.kind
+  return kind === 'error' || kind === 'blocked'
+}
+
+function idleKind(binding: SessionBinding | undefined, phase: string | undefined, failed: boolean, runTurnEndSeq?: number): ReminderKind | undefined {
+  if (phase === 'blocked' || failed || hasAgentFailure(binding)) return 'failed'
+  const ending = lastTurnEnd(binding)
+  const fresh = ending?.seq !== undefined && ending.seq !== runTurnEndSeq
+  const kind = fresh ? ending?.kind : undefined
+  if (kind === 'error' || kind === 'blocked') return 'failed'
+  if (kind === 'aborted' || kind === 'interrupted') return undefined
+  if (phase === 'complete' || kind === 'completed') return 'completed'
+  // A run that stops without a successful turn/end is not a completion.
+  return 'failed'
+}
+
 function eventFor(item: SessionSummary, previous: ObservedSession): ReminderKind | undefined {
   const pending = item.pendingInteraction
   if (pending === 'approval' && previous.pending !== 'approval') return 'approval'
@@ -363,9 +420,13 @@ function eventFor(item: SessionSummary, previous: ObservedSession): ReminderKind
 
 function installReminder(ctx: ClientContext): () => void {
   const observed = new Map<string, ObservedSession>()
-  const failedUntil = new Map<string, number>()
+  const failedSessions = new Set<string>()
   const pendingIdle = new Map<string, ReturnType<typeof setTimeout>>()
   const idleNotified = new Set<string>()
+  const watches = new Map<string, () => void>()
+  const seenTurnEnd = new Map<string, number | undefined>()
+  const seenAgentError = new Map<string, string | null>()
+  const turnEndAtRun = new Map<string, number | undefined>()
 
   const cancelPendingIdle = (sessionId: string) => {
     const timer = pendingIdle.get(sessionId)
@@ -373,24 +434,65 @@ function installReminder(ctx: ClientContext): () => void {
     pendingIdle.delete(sessionId)
   }
 
-  const isFailed = (sessionId: string, phase?: string): boolean => {
-    if (phase === 'blocked') return true
-    const until = failedUntil.get(sessionId)
-    return until !== undefined && until > Date.now()
-  }
-
-  const markFailed = (sessionId: string) => {
-    if (sessionOrigin(ctx.sessions.list.getSnapshot(), sessionId) === 'subagent') return
-    failedUntil.set(sessionId, Date.now() + FAILED_TURN_WINDOW_MS)
-    cancelPendingIdle(sessionId)
+  const unwatch = (sessionId: string) => {
+    watches.get(sessionId)?.()
+    watches.delete(sessionId)
   }
 
   const notifyIdle = (sessionId: string, phase?: string) => {
     if (idleNotified.has(sessionId)) return
+    const kind = idleKind(bindingOf(ctx, sessionId), phase, failedSessions.has(sessionId), turnEndAtRun.get(sessionId))
+    if (!kind) return
     idleNotified.add(sessionId)
-    const kind: ReminderKind = isFailed(sessionId, phase) ? 'failed' : 'completed'
-    failedUntil.delete(sessionId)
+    failedSessions.delete(sessionId)
     notifyReminder(ctx, kind)
+  }
+
+  const markFailed = (sessionId: string) => {
+    if (sessionOrigin(ctx.sessions.list.getSnapshot(), sessionId) === 'subagent') return
+    failedSessions.add(sessionId)
+    cancelPendingIdle(sessionId)
+    const latest = observed.get(sessionId)
+    if (latest && !latest.running) notifyIdle(sessionId, latest.goalPhase)
+  }
+
+  const inspectBinding = (sessionId: string) => {
+    const binding = bindingOf(ctx, sessionId)
+    if (!binding) return
+    let error: string | null = null
+    try {
+      error = binding.session.getSnapshot().lastAgentError ?? null
+    } catch {
+      error = null
+    }
+    if (error && seenAgentError.get(sessionId) !== error) {
+      seenAgentError.set(sessionId, error)
+      markFailed(sessionId)
+    } else if (!seenAgentError.has(sessionId)) {
+      seenAgentError.set(sessionId, error)
+    }
+    const ending = lastTurnEnd(binding)
+    if (!seenTurnEnd.has(sessionId)) {
+      seenTurnEnd.set(sessionId, ending?.seq)
+      return
+    }
+    if (ending?.seq !== undefined && ending.seq !== seenTurnEnd.get(sessionId)) {
+      seenTurnEnd.set(sessionId, ending.seq)
+      if (ending.kind === 'error' || ending.kind === 'blocked') markFailed(sessionId)
+    }
+  }
+
+  const watchSession = (sessionId: string) => {
+    if (watches.has(sessionId)) return
+    const binding = bindingOf(ctx, sessionId)
+    if (!binding) return
+    inspectBinding(sessionId)
+    const stopSession = binding.session.subscribe(() => inspectBinding(sessionId))
+    const stopEvents = binding.eventSource.subscribe(() => inspectBinding(sessionId))
+    watches.set(sessionId, () => {
+      stopSession()
+      stopEvents()
+    })
   }
 
   const reconcile = async () => {
@@ -403,27 +505,30 @@ function installReminder(ctx: ClientContext): () => void {
       const sessionId = item.sessionId ?? item.id
       if (!sessionId || item.origin === 'subagent') continue
       live.add(sessionId)
+      watchSession(sessionId)
+      inspectBinding(sessionId)
       const prior = observed.get(sessionId)
       const current: ObservedSession = {
         running: item.running,
         pending: item.pendingInteraction,
         goalPhase: goalPhaseOf(item),
       }
+      if (!prior && item.running) turnEndAtRun.set(sessionId, lastTurnEnd(bindingOf(ctx, sessionId))?.seq)
       if (prior) {
         const kind = eventFor(item, prior)
         if (kind) notifyReminder(ctx, kind)
         if (prior.running && !item.running) {
           cancelPendingIdle(sessionId)
-          if (kind === 'failed' || kind === 'completed' || kind === 'approval' || kind === 'question' || current.pending) {
+          if (kind === 'approval' || kind === 'question' || current.pending) {
             idleNotified.add(sessionId)
-            failedUntil.delete(sessionId)
-          } else if (isFailed(sessionId, current.goalPhase)) {
-            notifyIdle(sessionId, current.goalPhase)
+            failedSessions.delete(sessionId)
+          } else if (kind === 'failed' || kind === 'completed') {
+            idleNotified.add(sessionId)
+            failedSessions.delete(sessionId)
           } else {
-            // Runtime errors emit api-session/error around the same time as
-            // running→idle. Wait briefly so a failure is not classified as success.
             pendingIdle.set(sessionId, setTimeout(() => {
               pendingIdle.delete(sessionId)
+              inspectBinding(sessionId)
               const latest = observed.get(sessionId)
               if (!latest || latest.running) return
               notifyIdle(sessionId, latest.goalPhase)
@@ -432,8 +537,9 @@ function installReminder(ctx: ClientContext): () => void {
         }
         if (!prior.running && item.running) {
           cancelPendingIdle(sessionId)
-          failedUntil.delete(sessionId)
+          failedSessions.delete(sessionId)
           idleNotified.delete(sessionId)
+          turnEndAtRun.set(sessionId, lastTurnEnd(bindingOf(ctx, sessionId))?.seq)
         }
       }
       observed.set(sessionId, current)
@@ -441,18 +547,27 @@ function installReminder(ctx: ClientContext): () => void {
     for (const sessionId of [...observed.keys()]) {
       if (live.has(sessionId)) continue
       cancelPendingIdle(sessionId)
+      unwatch(sessionId)
       observed.delete(sessionId)
-      failedUntil.delete(sessionId)
+      failedSessions.delete(sessionId)
       idleNotified.delete(sessionId)
+      seenTurnEnd.delete(sessionId)
+      seenAgentError.delete(sessionId)
+      turnEndAtRun.delete(sessionId)
     }
   }
-  ctx.remote.$on('api-session/error', (sessionId) => {
-    markFailed(sessionId)
-    const latest = observed.get(sessionId)
-    if (latest && !latest.running) notifyIdle(sessionId, latest.goalPhase)
+  const stopError = ctx.remote.$on('api-session/error', (...args: unknown[]) => {
+    const sessionId = args.find((value): value is string => typeof value === 'string' && value.length > 0)
+    if (sessionId) markFailed(sessionId)
   })
   void reconcile()
-  return ctx.sessions.list.subscribe(() => { void reconcile() })
+  const stopList = ctx.sessions.list.subscribe(() => { void reconcile() })
+  return () => {
+    stopList()
+    if (typeof stopError === 'function') stopError()
+    for (const sessionId of pendingIdle.keys()) cancelPendingIdle(sessionId)
+    for (const sessionId of [...watches.keys()]) unwatch(sessionId)
+  }
 }
 
 const LOCALE_NS = 'dsh-reminder'

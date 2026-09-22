@@ -13,7 +13,7 @@ The plugin can remind you when a main session:
 - Completes.
 - Fails or becomes blocked.
 
-It does not remind for long-running work alone, repeated unchanged states, or subagent events. It suppresses reminders while the DSH renderer is focused. A runtime error on the main session is classified as failed, not completed.
+It does not remind for long-running work alone, repeated unchanged states, or subagent events. It suppresses reminders while the DSH renderer is focused. A runtime error on the main session, including an invalid LLM API, is classified as failed, not completed. The plugin reads the session error snapshot and the last `turn/end` reason instead of treating every idle edge as success.
 
 ## Settings
 
