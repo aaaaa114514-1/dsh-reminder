@@ -66,6 +66,7 @@ type Sessions = {
 
 type Remote = {
   $on(event: 'user-questions/request' | 'approval/request', listener: (this: unknown, request: unknown, next: () => Promise<unknown>) => Promise<unknown>): void
+  $on(event: 'api-session/error', listener: (sessionId: string, message: string) => void): void
 }
 
 type PendingInteraction = { key: string; kind: 'approval' | 'question' | 'plan-review' | string }
@@ -331,38 +332,125 @@ function installInteractionReminders(ctx: ClientContext): () => void {
   return dispose
 }
 
-function eventFor(item: SessionSummary, previous: { running: boolean; pending?: string; goalPhase?: string }): ReminderKind | undefined {
+const FAILED_TURN_WINDOW_MS = 15_000
+const IDLE_CLASSIFY_MS = 800
+
+type ObservedSession = {
+  running: boolean
+  pending?: string
+  goalPhase?: string
+}
+
+function goalPhaseOf(item: SessionSummary): string | undefined {
+  const goal = item.projectionValues?.goal as { phase?: string } | undefined
+  return goal?.phase
+}
+
+function sessionOrigin(snapshot: SessionListSnapshot, sessionId: string): string | undefined {
+  const item = snapshot.items?.find((entry) => (entry.sessionId ?? entry.id) === sessionId) ?? snapshot.byId?.[sessionId]
+  return item?.origin
+}
+
+function eventFor(item: SessionSummary, previous: ObservedSession): ReminderKind | undefined {
   const pending = item.pendingInteraction
   if (pending === 'approval' && previous.pending !== 'approval') return 'approval'
   if (pending === 'question' && previous.pending !== 'question') return 'question'
-  const goal = item.projectionValues?.goal as { phase?: string } | undefined
-  const phase = goal?.phase
+  const phase = goalPhaseOf(item)
   if (phase === 'blocked' && previous.goalPhase !== 'blocked') return 'failed'
   if (phase === 'complete' && previous.goalPhase !== 'complete') return 'completed'
-  if (previous.running && !item.running) return 'completed'
   return undefined
 }
 
 function installReminder(ctx: ClientContext): () => void {
-  const observed = new Map<string, { running: boolean; pending?: string; goalPhase?: string }>()
+  const observed = new Map<string, ObservedSession>()
+  const failedUntil = new Map<string, number>()
+  const pendingIdle = new Map<string, ReturnType<typeof setTimeout>>()
+  const idleNotified = new Set<string>()
+
+  const cancelPendingIdle = (sessionId: string) => {
+    const timer = pendingIdle.get(sessionId)
+    if (timer !== undefined) clearTimeout(timer)
+    pendingIdle.delete(sessionId)
+  }
+
+  const isFailed = (sessionId: string, phase?: string): boolean => {
+    if (phase === 'blocked') return true
+    const until = failedUntil.get(sessionId)
+    return until !== undefined && until > Date.now()
+  }
+
+  const markFailed = (sessionId: string) => {
+    if (sessionOrigin(ctx.sessions.list.getSnapshot(), sessionId) === 'subagent') return
+    failedUntil.set(sessionId, Date.now() + FAILED_TURN_WINDOW_MS)
+    cancelPendingIdle(sessionId)
+  }
+
+  const notifyIdle = (sessionId: string, phase?: string) => {
+    if (idleNotified.has(sessionId)) return
+    idleNotified.add(sessionId)
+    const kind: ReminderKind = isFailed(sessionId, phase) ? 'failed' : 'completed'
+    failedUntil.delete(sessionId)
+    notifyReminder(ctx, kind)
+  }
+
   const reconcile = async () => {
     await ensurePreferences(ctx)
     const snapshot = ctx.sessions.list.getSnapshot()
     // 0.1.2+ provides an item array keyed by sessionId; older runtimes used ids/byId.
     const entries = snapshot.items ?? (snapshot.ids ?? []).map((id) => snapshot.byId?.[id]).filter((item): item is SessionSummary => item !== undefined)
+    const live = new Set<string>()
     for (const item of entries) {
       const sessionId = item.sessionId ?? item.id
       if (!sessionId || item.origin === 'subagent') continue
+      live.add(sessionId)
       const prior = observed.get(sessionId)
-      const goal = item.projectionValues?.goal as { phase?: string } | undefined
-      const current = { running: item.running, pending: item.pendingInteraction, goalPhase: goal?.phase }
+      const current: ObservedSession = {
+        running: item.running,
+        pending: item.pendingInteraction,
+        goalPhase: goalPhaseOf(item),
+      }
       if (prior) {
         const kind = eventFor(item, prior)
         if (kind) notifyReminder(ctx, kind)
+        if (prior.running && !item.running) {
+          cancelPendingIdle(sessionId)
+          if (kind === 'failed' || kind === 'completed' || kind === 'approval' || kind === 'question' || current.pending) {
+            idleNotified.add(sessionId)
+            failedUntil.delete(sessionId)
+          } else if (isFailed(sessionId, current.goalPhase)) {
+            notifyIdle(sessionId, current.goalPhase)
+          } else {
+            // Runtime errors emit api-session/error around the same time as
+            // running→idle. Wait briefly so a failure is not classified as success.
+            pendingIdle.set(sessionId, setTimeout(() => {
+              pendingIdle.delete(sessionId)
+              const latest = observed.get(sessionId)
+              if (!latest || latest.running) return
+              notifyIdle(sessionId, latest.goalPhase)
+            }, IDLE_CLASSIFY_MS))
+          }
+        }
+        if (!prior.running && item.running) {
+          cancelPendingIdle(sessionId)
+          failedUntil.delete(sessionId)
+          idleNotified.delete(sessionId)
+        }
       }
       observed.set(sessionId, current)
     }
+    for (const sessionId of [...observed.keys()]) {
+      if (live.has(sessionId)) continue
+      cancelPendingIdle(sessionId)
+      observed.delete(sessionId)
+      failedUntil.delete(sessionId)
+      idleNotified.delete(sessionId)
+    }
   }
+  ctx.remote.$on('api-session/error', (sessionId) => {
+    markFailed(sessionId)
+    const latest = observed.get(sessionId)
+    if (latest && !latest.running) notifyIdle(sessionId, latest.goalPhase)
+  })
   void reconcile()
   return ctx.sessions.list.subscribe(() => { void reconcile() })
 }
